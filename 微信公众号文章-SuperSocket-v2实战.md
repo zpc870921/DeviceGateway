@@ -12,28 +12,32 @@
 
 这篇文章不讲框架有多强，只讲**我在这个项目里实际做了什么、踩了什么坑，以及哪些地方代码还没写完**。所有代码都来自仓库里一个能编译、能跑起来的项目（`DeviceGateway`）。
 
-> **先把话说在前面**：文末有一节专门列了「当前代码里还没做对的地方」，包括 **29 个失败的单元测试**。那些坑我没有藏起来 —— 比起给一篇看起来无懈可击的文章，把真实的工程状态写清楚更有用。
+> **先把话说在前面**：文末有一节专门列了「当前代码里还没做对的地方」，包括 **26 个失败的单元测试**。那些坑我没有藏起来 —— 比起给一篇看起来无懈可击的文章，把真实的工程状态写清楚更有用。
+
+> **版本口径**：本文所有代码与结论对应仓库当前状态 —— .NET 10 + SuperSocket **2.1.0**（`SuperSocket.Server` / `SuperSocket.Command` / `SuperSocket.ProtoBase` / `SuperSocket.Client`）。文中所有关于框架行为的判断（`FixedHeaderPipelineFilter` 的假设、`MaxPackageLength` 的比对对象、`LastActiveTime` 的刷新时机、`CommandAttribute.Key` 的类型）都通过反射读取 SuperSocket 2.1.0 程序集核对过，不是凭印象。
 
 ---
 
 ## 一、项目长什么样
 
-一个 .NET 10 的解决方案，三个项目：
+一个 .NET 10 的解决方案，三个项目 + 一个测试项目：
 
 ```
-multihostdemo/
+DeviceGateway/
+├── DeviceGateway.slnx
 ├── src/
 │   ├── DeviceGateway.Shared/     协议契约（服务端与客户端共用同一份实现）
 │   │   ├── Protocol/             帧格式、拆包过滤器、编码器
-│   │   └── Contracts/            JSON 配置
+│   │   └── Contracts/            JSON 配置、消息负载 DTO
 │   ├── DeviceGateway.Server/     Web API + SuperSocket 服务端
 │   │   ├── Commands/             心跳、位置数据命令
 │   │   ├── Registry/             设备注册表
 │   │   ├── Sessions/             设备会话
 │   │   ├── Background/           离线看门狗
-│   │   └── Controllers/          HTTP 接口
+│   │   └── Controllers/          HTTP 接口（Controller/Action）
 │   └── DeviceGateway.Client/     EasyClient 设备模拟器
-└── tests/DeviceGateway.Tests/    协议拆包与设备注册表单元测试
+└── tests/
+    └── DeviceGateway.Tests/      协议拆包与设备注册表单元测试（130 个用例）
 ```
 
 **为什么单独抽一个 Shared**：帧格式只定义一次。客户端和服务端共用**同一个**过滤器与编码器，避免两边各写一套、逐渐漂移。这是这类项目最容易出问题的地方 —— 客户端按小端写、服务端按大端读，这种 bug 在联调前不会暴露。
@@ -47,12 +51,12 @@ multihostdemo/
 | 字段 | 说明 |
 |---|---|
 | `0x55` | 帧起始标记 |
-| `LEN` | **JSON 负载的字节数 n**（不含类型字节、不含长度域本身）。4 字节**大端序** |
+| `LEN` | **JSON 负载的字节数 n**（不含类型字节、不含长度域本身、不含帧尾）。4 字节**大端序** |
 | `TYPE` | 消息类型：`0x01` 心跳、`0x02` 位置数据、`0x03` 通用上报 |
 | `JSON` | UTF-8 编码的 JSON 负载 |
 | `0xAA` | 帧结束标记 |
 
-整帧长度 = `n + 6` 字节。这个定义只有一处：
+**整帧长度 = `n + 7` 字节**（帧头 6 字节 + 帧尾 1 字节）。这个定义只有一处：
 
 ```csharp
 // src/DeviceGateway.Shared/Protocol/DeviceFrame.cs
@@ -62,12 +66,14 @@ public static class DeviceFrame
     public const byte EndMark = 0xAA;
     public const int LengthFieldSize = 4;
     public const int MessageTypeFieldSize = 1;
-    public const int HeaderSize = 1 + LengthFieldSize + MessageTypeFieldSize;
+    public const int HeaderSize = 1 + LengthFieldSize + MessageTypeFieldSize;  // = 6
 
     public static int TotalLength(int jsonPayloadLength) => jsonPayloadLength + HeaderSize + 1;
     public static int EndMarkOffset(int jsonPayloadLength) => HeaderSize + jsonPayloadLength;
 }
 ```
+
+> ⚠️ **这里有个我自己踩过的 off-by-one**：我最初在文档里写的是"整帧长度 = n + 6"，少算了帧尾那 1 个字节。代码里的 `TotalLength` 是 `n + HeaderSize + 1`（`+6 +1`），也就是 **n + 7**。这种错误只写在文档里还不要紧 —— 一旦编码器和解码器各按各的理解写，就变成"设备发 24 字节、服务端等 25 字节"的死锁。**长度语义必须只有一个定义来源，并且代码和文档对得上。**
 
 ---
 
@@ -87,7 +93,8 @@ var superSocketBuilder = builder.Host.AsSuperSocketHostBuilder<DevicePackage, De
         options.RegisterUnknownPackageHandler<DevicePackage>((session, package, ct) =>
         {
             session.GetDefaultLogger().LogWarning(
-                "收到未支持的消息类型 0x{MsgType:X2}，已忽略", package.MessageType);
+                "收到未支持的消息类型 0x{MsgType:X2}，负载：{Payload}，已忽略",
+                package.MessageType, package.Payload);
             return ValueTask.CompletedTask;
         });
     })
@@ -125,7 +132,7 @@ public sealed class DevicePackage : IKeyedPackageInfo<byte>
 {
     public byte Key { get; set; }              // 消息类型字节
     public byte MessageType => Key;            // 业务语义别名
-    public string Payload { get; set; } = "";  // JSON 负载
+    public string Payload { get; set; } = "";  // JSON 负载（已是文本，不再二次序列化）
 }
 ```
 
@@ -160,7 +167,7 @@ SuperSocket 的 TCP 监听和 ASP.NET Core 的 HTTP 监听跑在**同一个 `IHo
 
 ### 先看内置 filter 为什么不够用
 
-**`FixedHeaderPipelineFilter<T>`** —— 我实际跑了一遍它的行为。基类的 `Filter` 内部用 `reader.Sequence.Slice(0, headerSize)` 取帧头，也就是**假定帧头就在序列的第 0 字节**，没有"扫描下一个 `0x55`"的能力。
+**`FixedHeaderPipelineFilter<T>`** —— 它实际的行为是：基类的 `Filter` 内部用 `reader.Sequence.Slice(0, headerSize)` 取帧头，也就是**假定帧头就在序列的第 0 字节**，没有"扫描下一个 `0x55`"的能力。
 
 我写了个最小复现，喂给它一个带脏字节前缀的缓冲区：
 
@@ -319,6 +326,7 @@ public class DeviceHeartbeatMonitor : BackgroundService
 
 ```jsonc
 "serverOptions": {
+  "name": "DeviceGateway",
   "listeners": [ { "ip": "any", "port": 5001, "backLog": 100, "noDelay": true } ],
   "idleSessionTimeOut": 600,
   "clearIdleSessionInterval": 120
@@ -328,6 +336,10 @@ public class DeviceHeartbeatMonitor : BackgroundService
   "offlineScanIntervalSeconds": 10
 }
 ```
+
+> 注意配置的**大小写**：`idleSessionTimeOut` 的 `Out` 是**大写 O**，写成 `idleSessionTimeout` 就绑不上了。这类配置项拼错不会报错 —— 只会静默地使用默认值。
+
+**离线判定的实际延迟是 90～100 秒**（90 秒超时 + 最多 10 秒扫描间隔）。
 
 ### 配套的关键设计：位置数据**不应该**刷新心跳时间
 
@@ -353,7 +365,36 @@ public class DeviceHeartbeatMonitor : BackgroundService
 >
 > `UseClearIdleSession` 只作为**回收僵死 socket 的另一层兜底**。
 
-> ⚠️ **这里是我当前代码的一个问题**：我在 `PositionCommand` 里其实是**调用了** `TouchHeartbeat` 的（见后文"已知问题"一节）。正确的做法应该是位置命令完全不碰心跳时间。
+**这个设计最终落在代码里，是三个方法各管一件事：**
+
+```csharp
+// DeviceRegistry.Bind —— 只回答"这条连接属于哪台设备"
+// 明确不碰 Status，也不碰 LastHeartbeatAt
+_devices[deviceId] = record with { ConnectedAt = now };
+
+// DeviceRegistry.TouchHeartbeat —— 只有心跳命令会调它
+// 只有当前绑定的 Session 才允许刷新，防止旧连接干扰新连接
+_devices[deviceId] = record with { LastHeartbeatAt = lastHeartbeatAt, Status = DeviceStatus.Online };
+
+// DeviceRegistry.IsCurrentSession —— 位置命令用它识别"旧连接"
+// 不刷新心跳、不改在线状态
+```
+
+于是 `PositionCommand` 里是这么写的：
+
+```csharp
+// 位置数据不刷新心跳时间、不改变在线状态 —— 离线判定只认心跳。
+// 这里只做"是不是当前绑定"的校验：设备重连后，旧连接上还在跑的
+// 数据处理任务不应该继续产生业务效果。
+if (!_registry.IsCurrentSession(deviceId, session))
+{
+    session.LogWarning("设备位置数据来自旧连接，已忽略，DeviceId: {DeviceId}", deviceId);
+    return;
+}
+```
+
+> **换句话说：只有 `0x01` 心跳能让设备变成在线。**
+> 只发位置数据、从不发心跳的设备在接口里一直显示离线 —— 这是刻意的，心跳才是"设备还活着"的唯一信号。
 
 ---
 
@@ -399,7 +440,7 @@ public bool TryBindDevice(string deviceId)
 校验不通过时，**丢弃这一帧，不要断开连接**：
 
 ```csharp
-session.Logger.LogWarning(
+session.LogWarning(
     "会话 {SessionId} 声称的设备标识 {Claimed} 与已绑定的 {Bound} 不一致，已丢弃",
     session.SessionID, deviceId, session.DeviceId);
 ```
@@ -483,7 +524,59 @@ public async Task SendPackageAsync(
 
 **双重检查（double check）不是多余的**：第一次检查在锁外，快速失败；第二次检查在锁内，避免"等锁期间连接已经关了"。
 
-关于用 `Channel` 还是 `SemaphoreSlim`：我最初的设计是**有界 `Channel` + 唯一写循环**，队列满时丢弃最旧的，慢设备就不会把 HTTP 请求拖住。但最终落地的是 `SemaphoreSlim` —— 它保证严格串行，语义更简单，代价是慢设备会阻塞发送方。**如果你的场景里发送方不能被慢设备阻塞，就得换回 `Channel`。**
+### 所有出口必须收敛到同一个方法
+
+这是我在实现过程中**专门加了一条测试**才守住的设计。`DeviceSession` 现在有三个看起来都能"发送"的方法：
+
+| 方法 | 作用 | 是否走发送锁 |
+|---|---|---|
+| `SendPackageAsync` | 唯一的真实发送出口 | ✅ |
+| `SendSerializedAsync` | `SendPackageAsync` 的可测试形态（持锁 + 注入 transport） | ✅ |
+| `ISessionHandle.SendAsync` | 注册表用的接口实现 | ✅ 转发到 `SendPackageAsync` |
+
+**三个全部走同一把锁。** 我特意把 `ISessionHandle.SendAsync` 写成转发而不是独立实现：
+
+```csharp
+public async Task SendAsync(DevicePackage package, CancellationToken cancellationToken)
+{
+    await SendPackageAsync(package, cancellationToken);
+}
+```
+
+如果有人图省事，直接在 `ISessionHandle.SendAsync` 里调 `((IAppSession)this).SendAsync(...)`，那就把发送锁绕过去了 —— 并发写立刻回来。**"所有出口收敛到同一个方法"不是风格问题，是并发正确性的前提。**
+
+### 为什么用 `SemaphoreSlim` 而不是 `Channel`
+
+我最初的设计是**有界 `Channel` + 唯一写循环**，队列满时丢弃最旧的，慢设备就不会把 HTTP 请求拖住。但最终落地的是 `SemaphoreSlim`：
+
+- **优点**：保证严格串行，语义更简单，出问题好排查
+- **代价**：慢设备会阻塞发送方 —— HTTP 请求会一直等
+
+**如果你的场景里发送方不能被慢设备阻塞，就得换回 `Channel`。** 这是个明确的取舍，不是"哪个更好"的问题。
+
+### 怎么测"并发写不会交错"
+
+这是我觉得最值得分享的一个测试技巧。直接测 socket 很难 —— 你没法稳定地制造竞态。做法是**把"持锁"和"怎么发"分开**：
+
+```csharp
+internal async Task SendSerializedAsync(
+    DevicePackage package,
+    Func<DevicePackage, CancellationToken, Task> transport,
+    CancellationToken cancellationToken)
+```
+
+生产环境传入真实的 socket 发送；单元测试传入一个记录用的假实现，然后**并发发起多次发送，检查假实现收到的包是否始终完整、顺序是否串行**：
+
+```csharp
+// 伪代码
+var received = new List<DevicePackage>();
+await Task.WhenAll(Enumerable.Range(0, 100).Select(i =>
+    session.SendSerializedAsync(package, (p, ct) => { received.Add(p); return Task.CompletedTask; }, default)));
+
+// 断言：received 里没有交错、没有丢失
+```
+
+**锁的逻辑因此可以被确定性地验证**，而不是靠压测碰运气。
 
 ---
 
@@ -538,6 +631,37 @@ if (staleSession != null)
 ```
 
 > **注意**：`CloseAsync()` 会触发关闭事件，进而回调 `UnbindAndMarkOffline`。因为有了上面的"比较删除"，这次回调会发现自己已经不是当前绑定，**安全地跳过**。两个机制是配套的。
+>
+> **另一个细节**：关闭旧连接必须在**注册表锁外**做。关闭可能要等网络操作，持着锁等会把整个注册表堵住。
+
+### 关于线程安全策略
+
+注册表目前用的是**一把大锁 `_gate`** 保护全部状态（两个 `Dictionary`）。这当然正确 —— 而且"状态转换的一致性"本来就比"并发读性能"重要。
+
+但要说清楚一点：**不是所有方法都必须在同一把锁下。** `ExpireHeartbeatSessions` 就是分两段的：
+
+```csharp
+// 第一步：锁内取快照
+lock (_gate) { snapshot = _devices.Values.ToArray(); }
+
+// 第二步：锁外筛选（纯计算，不碰共享状态）
+var candidates = snapshot.Where(x => x.Status == DeviceStatus.Online &&
+                                      now - x.LastHeartbeatAt > timeout).ToArray();
+
+// 第三步：逐个设备重新进锁做最终确认
+foreach (var candidate in candidates)
+{
+    lock (_gate)
+    {
+        // 重新读取最新状态 —— 期间可能已经变了
+        if (current.Status != DeviceStatus.Online) continue;
+        if (now - current.LastHeartbeatAt <= timeout) continue;
+        ...
+    }
+}
+```
+
+**"锁内取快照 → 锁外计算 → 锁内复核"** 是处理这类"扫描 + 条件更新"的标准姿势。锁外那段不会持有任何共享状态的引用，所以安全。
 
 ---
 
@@ -575,6 +699,11 @@ public static class DeviceGatewayJson
         Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
+
+    public static bool TryDeserialize<T>(string json, out T? value)
+    {
+        // 设备数据不可信，一条坏消息不能让连接崩掉 —— 捕获异常，返回 false
+    }
 }
 ```
 
@@ -612,9 +741,10 @@ public static class DeviceGatewayJson
 ┌───────────────────────────────────────────────┐
 │ DeviceRegistry        ← 设备档案 + 在线会话      │
 │   TryBind → 首次绑定 / 之后校验                 │
-│   Bind → 重连踢旧连接                          │
+│   Bind → 重连踢旧连接（不改在线状态）           │
 │   UnbindAndMarkOffline → 比较删除              │
-│   TouchHeartbeat → 刷新心跳时间                │
+│   TouchHeartbeat → 刷新心跳 + 置在线            │
+│   IsCurrentSession → 位置数据识别旧连接         │
 └──────────────┬────────────────────────────────┘
                ▼
 ┌───────────────────────────────────────────────┐
@@ -651,6 +781,11 @@ client.StartReceive();     // ← 别忘了启动接收循环
 
 > ⚠️ **`StartReceive()` 必须显式调用。** `ConnectAsync` 只负责连接，接收循环要自己启动。忘了这行，客户端连上了但永远收不到服务端的下行消息。
 
+**模拟器的两个工程细节**：
+
+- **重连要退避**：从 1 秒开始，每次翻倍，上限 30 秒。没有退避的无限重连，遇到服务端重启时会打成一片。
+- **连上先发一次心跳**：让服务端尽快登记设备，不用干等第一个心跳周期。
+
 ---
 
 ## 十、跑起来看看
@@ -661,8 +796,14 @@ client.StartReceive();     // ← 别忘了启动接收循环
 dotnet run --project src/DeviceGateway.Server
 ```
 
-- 设备接入 TCP 端口：`5001`
-- HTTP 接口端口：`8080`
+- 设备接入 TCP 端口：`5001`（配置在 `appsettings.json` 的 `serverOptions.listeners`）
+- HTTP 接口端口：`launchSettings.json` 里是 **5223**（http）/ **7022**（https）
+
+> 注意 HTTP 端口和 TCP 端口是**两套完全独立的配置**：TCP 在 `serverOptions.listeners`，HTTP 在 ASP.NET Core 自己的 `applicationUrl`。想固定用 8080 就显式指定：
+
+```bash
+dotnet run --project src/DeviceGateway.Server --urls "http://localhost:8080"
+```
 
 ### 启动模拟设备
 
@@ -708,6 +849,32 @@ curl http://localhost:8080/api/Health/Check
 | 参数非法（空、给自己发） | 400 | — |
 | 发送过程抛异常 | 502 | — |
 
+### 手工验证分片与脏数据
+
+用裸 TCP 客户端精确控制字节到达的时机：
+
+```python
+import socket, struct, json, time
+
+def frame(t, payload):
+    f = bytearray()
+    f.append(0x55); f += struct.pack(">I", len(payload)); f.append(t)
+    f += payload; f.append(0xAA)
+    return bytes(f)
+
+s = socket.create_connection(("127.0.0.1", 5001))
+f = frame(0x01, json.dumps({"deviceId": "SPLIT-001"}).encode())
+
+s.sendall(f[:len(f)//2])      # 前半
+time.sleep(2.0)
+s.sendall(f[len(f)//2:])      # 后半
+time.sleep(1.0)
+```
+
+然后 `curl http://localhost:8080/api/Device/List` 确认 `SPLIT-001` 已登记。
+在前面加几个垃圾字节（如 `b"\xde\xad\xbe\xef"`）再试一次 —— 设备仍应被正确登记，
+服务端日志里也不应出现 `Protocol error`。
+
 ---
 
 ## 十一、部署时的两个坑
@@ -734,6 +901,13 @@ docker run -p 8080:8080 -p 5001:5001 \
   device-gateway:dev
 ```
 
+Dockerfile 是多阶段构建，用非 root 用户运行，并且带健康检查：
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["/bin/sh", "-c", "curl -fsS http://127.0.0.1:8080/api/Health/Check || exit 1"]
+```
+
 ### 坑：日志刷屏
 
 ```jsonc
@@ -747,6 +921,8 @@ docker run -p 8080:8080 -p 5001:5001 \
 注意类别名是 **`SuperSocketService`** —— **不是你的命令类名**。因为 `session.Logger` 是框架内部创建的 logger，类别是框架的。
 
 设备每秒上报一次位置，用 `Information` 级别会刷屏。**生产环境保持默认的 `Information`，`Debug` 只在开发时开启。**
+
+> 顺便一提：我一开始把这个日志写成了 `Debug`，结果发现"日志根本不打印"—— 因为默认配置下 `Debug` 是关闭的。**开发期要看的日志，就别写在默认不开的级别上。**
 
 ---
 
@@ -766,7 +942,7 @@ var app = builder.Build();
 app.AdaptMultipleServerHost();   // ← 必须调用
 ```
 
-**每个厂家 = 一个独立的包类型 + 一个独立的过滤器 + 一个独立的监听端口。** 参照仓库里已跑通的 `ssdemo01` 多服务模板。
+**每个厂家 = 一个独立的包类型 + 一个独立的过滤器 + 一个独立的监听端口。**
 
 两个坑（来自 `ssdemo01` 的实践，**本项目尚未在多 Server 下验证**）：
 
@@ -806,82 +982,74 @@ HTTP 请求打到副本 B → 副本 B 查不到该设备 → 跨设备消息发
 
 ## 十四、当前代码里还没做对的地方
 
-这一节是这篇文章里我最想写清楚的。**上面的方案有一半还没在代码里真正落地**，我把它们如实列出来。
+这一节是这篇文章里我最想写清楚的。**上面的方案有一部分还没在代码里真正落地**，我把它们如实列出来。
 
-### 1. 29 个单元测试是失败的
-
-```
-失败!  - 失败: 29，通过: 23，已跳过: 0，总计: 52
-```
-
-失败原因分三类：
-
-**（a）自定义 filter 根本没实现重同步 —— 这是最要命的一条。**
-
-`src/DeviceGateway.Shared/Protocol/DeviceFrameFilter.cs` 继承 `FixedHeaderPipelineFilter<DevicePackage>`，但**只覆写了 `GetBodyLengthFromHeader` 和 `DecodePackage` 两个钩子，没有覆写 `Filter` 方法本身**。而基类的 `Filter` 假定帧头就在序列第 0 字节，于是：
+### 1. 26 个单元测试是失败的
 
 ```
-System.ArgumentOutOfRangeException : Specified argument was out of the range of valid values. (Parameter 'count')
-   at System.Buffers.SequenceReader`1.AdvanceToNextSpan(Int64 count)
+失败!  - 失败: 26，通过: 104，已跳过: 0，总计: 130
+```
+
+**全部 26 个失败都集中在一个根因**：当前的 `DeviceFrameFilter` 继承 `FixedHeaderPipelineFilter<DevicePackage>`，而**它抛异常**。
+
+失败分布：
+
+| 测试类 | 失败 | 通过 | 总数 |
+|---|---|---|---|
+| `DeviceFrameFilterTests` | 8 | 15 | 23 |
+| `DeviceFrameValidationTests` | 8 | 5 | 13 |
+| `DeviceFrameFragmentationTests` | 5 | 4 | 9 |
+| `DeviceFrameFrameworkContractTests` | 5 | 6 | 11 |
+| 其余 6 个测试类（编码器/注册表/会话/命令） | 0 | 104 | 104 |
+
+**失败堆栈长这样**：
+
+```
+SuperSocket.ProtoBase.ProtocolException : 非法帧头
+   at DeviceGateway.Shared.Protocol.DeviceFrameFilter.GetBodyLengthFromHeader(...)
+      in ...\DeviceFrameFilter.cs:line 61
    at SuperSocket.ProtoBase.FixedHeaderPipelineFilter`1.Filter(SequenceReader`1& reader)
 ```
 
-9 个测试栽在这里。**换句话说：现在这个 filter 连一个干净的完整帧都解不出来**（我上面那个"干净帧"能解出来，是因为我用的是自己写的最小复现类，不是项目里这个）。
+**这意味着什么？** 回顾第三节的原则二 —— **filter 抛异常 = 断连，不是容错**。SuperSocket 2.1.0 的 `PipeConnectionBase.ReadBuffer` 收到 filter 抛出的 `ProtocolException`，会以 `CloseReason.ProtocolError` **关闭连接**。
 
-重同步的完整实现其实**写好了**，但在另一个文件里：
+所以现在的真实行为是：
 
-```
-src/DeviceGateway.Shared/Protocol/DeviceFrameFilter - 复制.cs
-```
+> **链路上只要出现一个脏字节，这条设备连接就被直接断开。**
 
-那个文件里的 `DeviceFrameFilter2` 是完整实现了"找帧头 + 脏数据重同步 + 按长度定位校验帧尾"的版本（240 行）。它**确实参与了编译**（SDK 默认的通配符规则会把所有 `.cs` 收进来），但 `Program.cs` 用的还是 `DeviceFrameFilter`，也没有任何测试引用 `DeviceFrameFilter2` —— 所以它是一个**编进了程序集却没人用的死代码**。
+而设计要求是"脏字节只重同步，不断连"。这两件事直接冲突。
 
-**正确的做法是把这套实现合并回 `DeviceFrameFilter`，让它覆盖掉基类的 `Filter`**，然后删掉这个 `- 复制.cs` 文件。
+**正确的实现其实写好了** —— 就在同一个文件下方，从第 186 行开始是一大段被注释掉的 `IPipelineFilter<DevicePackage>` 实现（约 220 行）：找帧头、跳过脏字节、按长度定位校验帧尾、无状态、绝不抛异常。**那段代码就是第三节讲的四条原则的落地。**
 
-> 这也是我想在文章里强调的一点：**测试是唯一能告诉你"你以为你写好了"的东西。** 我在这个项目里一度以为 filter 写好了 —— 因为注释写得很完整、逻辑读起来很对。但 29 个红灯摆在那儿。
+它没生效的原因很朴素：类名撞了。那段实现也叫 `DeviceFrameFilter`，所以在重命名时整块被注释掉了。**正确的做法是把这套实现启用、删掉现在这个继承基类的版本** —— 因为继承 `FixedHeaderPipelineFilter` 就得把 `Filter` 整个覆盖掉，那时基类只剩三个自动属性可用。
 
-**（b）测试引用了已经改名/删除的 API。**
+> 这也是我想在文章里强调的一点：**测试是唯一能告诉你"你以为你写好了"的东西。** 我在这个项目里一度以为 filter 写好了 —— 因为注释写得很完整、逻辑读起来很对。但 26 个红灯摆在那儿。
 
-比如 `DeviceRegistryTests` 里调 `registry.Unbind(...)`，但现在的方法叫 `UnbindAndMarkOffline(...)`；断言被整段注释掉了：
+**关于测试本身的两点说明**：
 
-```csharp
-//var removed = registry.Unbind("DRONE-001", oldSession);
-//Assert.False(removed);
-```
+- 测试里那个 `FrameDecoder` 辅助类是**逐行对照** `PipeConnectionBase.ReadBuffer` 的语义写的，严格遵守三条契约：每轮循环新建 `SequenceReader`、解出包后才调 `Reset()`、返回 null 时按消费量决定去留。**所以这些用例同时也在验证"过滤器满足框架调用契约"**，不是自说自话的单元测试。
+- 有一类用例特别值得注意：`Framework_FilterNeverThrows_AcrossGarbageCorpus` 会喂 **2000 个随机缓冲区**（固定种子 `20261101`）断言"永不抛异常"。**随机语料 + 铁律断言**，这是测 filter 最省心的方式 —— 你不用穷举自己想得到的坏输入。
 
-`DeviceSessionLifecycleTests` 里在测 `Dispose` 的幂等性，但 `DeviceSession` 现在**根本没有 `Dispose` 方法** —— 那些 `session.Dispose()` 也被注释掉了，测试就变成了"什么也不做然后断言不抛异常"。
+### 2. `PositionCommand` 的心跳处理 —— 已经改对了
 
-**（c）`PositionCommand` 实际上刷新了心跳。**
+这一条曾经是错的（当时 `PositionCommand` 里调的是 `TouchHeartbeat`，和高频数据不刷新心跳的规则矛盾）。**现在已经改成了 `IsCurrentSession`** —— 只校验"是不是当前绑定"，不碰心跳时间、不碰在线状态。
 
-```csharp
-var success = _registry.TouchHeartbeat(deviceId, session, now);
-```
+对应地，测试 `PositionCommandTests`（12 个用例）全绿，锁的就是这条需求。
 
-这跟第四节说的"位置数据不刷新心跳时间"是**矛盾**的。当前代码里，设备只要还在发位置数据，心跳就永远会被刷新 —— **离线判定等于没有**。测试 `FindHeartbeatExpired_IgnoresNonHeartbeatActivity` 正是为了盯这个行为，但它现在也是失败的。
+**但这也说明了一件事**：这类"设计意图 vs 代码实现"的偏差，**光看代码是发现不了的** —— 代码读起来完全合理。是测试把它钉住的。
 
-### 2. 会话的"单一写者"没有做到真正的单一
+### 3. README 和代码有出入
 
-`DeviceSession` 里 `using System.Threading.Channels;` 还留着，但**根本没有用 `Channel`** —— 实现是 `SemaphoreSlim` + 直接调 `SendAsync`。这能保证串行，但有两个后果：
+文档和实现不一致的地方，**比 bug 更难发现**，因为读哪边都"说得通"：
 
-- 发送方会被慢设备阻塞（HTTP 请求会一直等）
-- 没有"队列满时丢弃最旧的"这种背压策略
+| 文档写的 | 代码实际 |
+|---|---|
+| 会话用"有界 `Channel` + 唯一写循环" | 用的是 `SemaphoreSlim`（源码里**根本没有 `Channel`**） |
+| 比较删除用 `ConcurrentDictionary` 的 `ICollection<KeyValuePair<>>.Remove` | 用的是 `lock (_gate)` + `ReferenceEquals` |
+| 整帧长度 = `n + 6` | `TotalLength` 是 `n + 7` |
+| `DeviceFrameFilter` 直接实现 `IPipelineFilter` | 当前继承 `FixedHeaderPipelineFilter`（重构中留下的不一致） |
 
-而且 `DeviceSession.SendAsync` 有个真实的 NPE：
-
-```csharp
-public async Task SendAsync(DevicePackage package, CancellationToken cancellationToken)
-{
-    await ((IAppSession)this).SendAsync(_encoder, package);   // ← 会话未真正连接时 NPE
-}
-```
-
-它直接走 `IAppSession.SendAsync`，而**没有走上面那个带 `ThrowIfClosing` 双重检查的 `SendPackageAsync`**。会话还没真正建立时调用它，会 `NullReferenceException`。测试 `SendAsync_AfterDispose_DoesNotThrow` 现在就是栽在这。
-
-**这三个出口应该收敛成同一个方法。**
-
-### 3. `DeviceRegistry` 的线程安全策略可以更简单
-
-现在用的是一把大锁 `_gate` 保护全部状态（`Dictionary` + `Dictionary`）。这当然正确，但性能上不如 `ConcurrentDictionary`。README 里描述的"用 `ConcurrentDictionary` 的 `ICollection<KeyValuePair<>>.Remove` 做比较删除"，和代码里实际的实现（`lock` + `ReferenceEquals`）也对不上。**不是 bug，但文档和代码要统一。**
+**文档会骗人，代码不会。** 但最好的结果是两边对齐 —— 尤其是 `Channel` vs `SemaphoreSlim` 这种会影响并发语义的分歧。
 
 ### 4. `DeviceRecord` 的 `Vendor` 字段目前是写死的
 
@@ -890,6 +1058,8 @@ public async Task SendAsync(DevicePackage package, CancellationToken cancellatio
 ### 5. 没有端到端集成测试
 
 现在的测试都是单元测试。**"设备连上来、发心跳、HTTP 下发消息、设备收到"这条完整链路，没有任何自动化测试覆盖。** 上面那些 filter 的问题，如果有一个端到端测试，第一天就能发现。
+
+README 里那段 Python 手工验证脚本就是权宜之计 —— **它验证了，但它不会在 CI 里跑**。
 
 ---
 
@@ -905,6 +1075,7 @@ public async Task SendAsync(DevicePackage package, CancellationToken cancellatio
 - [ ] 多段 `ReadOnlySequence` 处理对了吗？（`FirstSpan()` 只在单段成立）
 - [ ] 编码器和解码器**长度语义一致**吗？（`LEN` 到底含不含帧尾）
 - [ ] 编码器**大端还是小端**？（必须和客户端一致）
+- [ ] **代码里的长度定义和文档一致吗？**（我在这上面栽过：文档写 n+6，代码是 n+7）
 
 **命令层**
 - [ ] 命令**显式注册**了吗？（`AddCommand<T>()`）
@@ -913,9 +1084,9 @@ public async Task SendAsync(DevicePackage package, CancellationToken cancellatio
 
 **会话层**
 - [ ] 自定义会话承载设备身份了吗？
-- [ ] **单一写者**吗？（并发写 = 字节交错）—— 并且所有出口都走**同一个**发送方法
+- [ ] **单一写者**吗？（并发写 = 字节交错）—— 并且**所有出口都走同一个**发送方法
 - [ ] 关闭事件里做的是**比较删除**吗？
-- [ ] 重连时**踢掉旧连接**了吗？
+- [ ] 重连时**踢掉旧连接**了吗？（且在**锁外**关闭）
 
 **业务层**
 - [ ] 在线状态是**业务心跳**判的，还是靠 `LastActiveTime`？（后者在高频数据下等于没有）
@@ -927,7 +1098,9 @@ public async Task SendAsync(DevicePackage package, CancellationToken cancellatio
 - [ ] 客户端和服务端**共用同一个 filter / encoder** 吗？
 - [ ] JSON 序列化配置**每层都统一**吗？（中文转义）
 - [ ] 容器内监听地址是 `any` 吗？
+- [ ] 配置项的**大小写**对吗？（`idleSessionTimeOut` 的 `Out` 是大写 O，写错静默用默认值）
 - [ ] 多 Server 时 DI 是**共享实例**还是各一份？
+- [ ] **文档和代码对得上吗？**（`Channel` vs `SemaphoreSlim`、`n+6` vs `n+7`）
 - [ ] **测试是红的吗？** —— 这一条应该放在最前面
 
 ---
@@ -942,12 +1115,12 @@ public async Task SendAsync(DevicePackage package, CancellationToken cancellatio
 
 框架选对了，能省掉大量机械劳动（会话管理、管道化读写、命令路由、宿主集成）。但剩下的部分一个都省不掉，**而这部分决定了你的系统是在 demo 里跑，还是能在机房里待一年。**
 
-那些"起得起来"的坑（`Key` 的装箱、JSON 转义）一测就发现；那些"出事了才暴露"的坑（并发写、重连误删、离线误判），**只能靠设计时想清楚 + 测试持续盯着**。
+那些"起得起来"的坑（`Key` 的装箱、JSON 转义、文档 off-by-one）一测就发现；那些"出事了才暴露"的坑（并发写、重连误删、离线误判），**只能靠设计时想清楚 + 测试持续盯着**。
 
 所以我想把这篇文章的重心放在两个地方：
 
 1. **框架的边界在哪** —— 哪些是 SuperSocket 管的，哪些是你必须自己写的；
-2. **代码的真实状态** —— 包括那 29 个失败的测试。
+2. **代码的真实状态** —— 包括那 26 个失败的测试。
 
 比起一篇看起来无懈可击的文章，我更希望这篇能让你在**照着做的时候顺手把自己的测试也写上** —— 因为上面那个"filter 其实没实现"的教训，只靠读代码是发现不了的。
 
@@ -955,7 +1128,7 @@ public async Task SendAsync(DevicePackage package, CancellationToken cancellatio
 
 *本文所有代码均来自仓库里的 `DeviceGateway` 项目（ASP.NET Core Web API + SuperSocket v2 命令模式设备接入网关），.NET 10 + SuperSocket 2.1.0。文中所有关于框架行为的判断（`FixedHeaderPipelineFilter` 的假设、`MaxPackageLength` 的比对对象、`LastActiveTime` 的刷新时机、`CommandAttribute.Key` 的类型）都通过反射读取 SuperSocket 2.1.0 程序集核对过，不是凭印象。*
 
-*第十四节列出的 29 个失败测试是当前仓库的真实状态，不是笔误。*
+*第十四节列出的 26 个失败测试是当前仓库的真实状态，不是笔误。*
 
 ```
 dotnet build
