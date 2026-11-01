@@ -71,10 +71,12 @@ public class PositionCommand : IAsyncCommand<DeviceSession, DevicePackage>
         // 设备是否在线由两件事决定：心跳是否超时（看门狗负责）、连接是否还在（会话负责）。
         // 位置数据两者都不改变。
         //
-        // 这里只记录一条 Debug 日志，便于观察设备是否在正常上报。
-        // （每秒一包的频率，用 Information 级别会刷屏，所以用 Debug。）
-        session.LogDebug(
-            "收到设备 {DeviceId} 的位置数据: {Payload}",
+        // 把收到的数据打印出来。
+        //
+        // 用 Information 级别而不是 Debug：默认配置下 Debug 是关闭的，
+        // 那样这条日志根本不会出现在控制台里，等于没打印。
+        session.LogInformation(
+            "收到设备 {DeviceId} 的位置数据，负载：{Payload}",
             deviceId, package.Payload);
     }
 }

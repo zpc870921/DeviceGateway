@@ -23,11 +23,6 @@ var builder = WebApplication.CreateBuilder(args);
 // ---------------------------------------------------------------------------
 var superSocketBuilder = builder.Host.AsSuperSocketHostBuilder<DevicePackage, DeviceFrameFilter>()
     .UseSession<DeviceSession>()
-    //.UsePackageHandler<DevicePackage>((session, package) =>
-    //{
-    //    Console.WriteLine("收到数据包：");
-    //    return ValueTask.CompletedTask;
-    //})
     .UseCommand(options =>
     {
         // 命令不会被自动发现，必须显式注册。
@@ -38,9 +33,12 @@ var superSocketBuilder = builder.Host.AsSuperSocketHostBuilder<DevicePackage, De
         // 设备发来未支持的消息类型时走这里，而不是让服务端崩掉。
         options.RegisterUnknownPackageHandler<DevicePackage>((session, package, ct) =>
         {
+            // 同样把收到的数据打印出来 —— 未支持的消息类型更需要看清楚内容，
+            // 排查"设备发了什么但服务端没处理"的问题时全靠它。
             session.GetDefaultLogger().LogWarning(
-                "收到未支持的消息类型 0x{MsgType:X2}，已忽略",
-                package.MessageType);
+                "收到未支持的消息类型 0x{MsgType:X2}，负载：{Payload}，已忽略",
+                package.MessageType,
+                package.Payload);
 
             return ValueTask.CompletedTask;
         });

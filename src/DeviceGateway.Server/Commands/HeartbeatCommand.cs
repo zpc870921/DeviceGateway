@@ -57,7 +57,12 @@ public class HeartbeatCommand : IAsyncCommand<DeviceSession, DevicePackage>
         // 刷新心跳时间 —— 离线判定只看这个时间。
         _registry.TouchHeartbeat(deviceId,session, now);
 
-        // 记录一条 Debug 日志，便于观察设备心跳是否正常到达。
-        session.LogDebug("收到设备 {DeviceId} 的心跳", deviceId);
+        // 把收到的数据打印出来。
+        //
+        // 用 Information 级别而不是 Debug：默认配置下 Debug 是关闭的，
+        // 那样这条日志根本不会出现在控制台里，等于没打印。
+        session.LogInformation(
+            "收到设备 {DeviceId} 的心跳，负载：{Payload}",
+            deviceId, package.Payload);
     }
 }
