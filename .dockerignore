@@ -1,0 +1,12 @@
+# 构建产物
+**/bin/
+**/obj/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# 本地日志与临时文件
+*.log
+*.user

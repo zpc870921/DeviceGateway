@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DeviceGateway.Client/DeviceGateway.Client.csproj" />
+    <Project Path="src/DeviceGateway.Server/DeviceGateway.Server.csproj" />
+    <Project Path="src/DeviceGateway.Shared/DeviceGateway.Shared.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/DeviceGateway.Tests/DeviceGateway.Tests.csproj" />
+  </Folder>
+</Solution>

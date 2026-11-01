@@ -1,0 +1,36 @@
+## Build output
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+artifacts/
+
+## Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## NuGet
+*.nupkg
+*.snupkg
+packages/
+!packages/build/
+
+## Test results
+[Tt]est[Rr]esult*/
+*.coverage
+coverage*.json
+coverage*.xml
+
+## OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+## Local environment overrides
+appsettings.*.local.json
+*.local.json
